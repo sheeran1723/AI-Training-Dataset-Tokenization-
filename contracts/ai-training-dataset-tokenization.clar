@@ -6,6 +6,9 @@
 (define-constant ERR_ALREADY_LICENSED (err u104))
 (define-constant ERR_INVALID_LICENSE_TYPE (err u105))
 (define-constant ERR_DATASET_ALREADY_EXISTS (err u106))
+(define-constant ERR_INVALID_RATING (err u107))
+(define-constant ERR_ALREADY_RATED (err u108))
+(define-constant ERR_NO_ACCESS_HISTORY (err u109))
 
 (define-data-var next-dataset-id uint u1)
 (define-data-var platform-fee-rate uint u250)
@@ -48,6 +51,22 @@
 (define-map creator-earnings
   principal
   uint)
+
+(define-map dataset-ratings
+  {dataset-id: uint, rater: principal}
+  {
+    rating: uint,
+    comment: (string-ascii 256),
+    rated-at: uint
+  })
+
+(define-map dataset-reputation
+  uint
+  {
+    total-ratings: uint,
+    rating-sum: uint,
+    average-rating: uint
+  })
 
 (define-public (mint-dataset 
   (name (string-ascii 64))
@@ -157,6 +176,36 @@
     (var-set platform-fee-rate new-rate)
     (ok true)))
 
+(define-public (rate-dataset 
+  (dataset-id uint)
+  (rating uint)
+  (comment (string-ascii 256)))
+  (let ((dataset (unwrap! (map-get? datasets dataset-id) ERR_DATASET_NOT_FOUND))
+        (existing-rating (map-get? dataset-ratings {dataset-id: dataset-id, rater: tx-sender}))
+        (license-usage-data (map-get? license-usage {dataset-id: dataset-id, licensee: tx-sender}))
+        (current-reputation (default-to {total-ratings: u0, rating-sum: u0, average-rating: u0} 
+                           (map-get? dataset-reputation dataset-id))))
+    (asserts! (>= rating u1) ERR_INVALID_RATING)
+    (asserts! (<= rating u5) ERR_INVALID_RATING)
+    (asserts! (is-none existing-rating) ERR_ALREADY_RATED)
+    (asserts! (is-some license-usage-data) ERR_NO_ACCESS_HISTORY)
+    (asserts! (> (get download-count (unwrap-panic license-usage-data)) u0) ERR_NO_ACCESS_HISTORY)
+    (map-set dataset-ratings 
+      {dataset-id: dataset-id, rater: tx-sender}
+      {
+        rating: rating,
+        comment: comment,
+        rated-at: stacks-block-height
+      })
+    (let ((new-total (+ (get total-ratings current-reputation) u1))
+          (new-sum (+ (get rating-sum current-reputation) rating)))
+      (map-set dataset-reputation dataset-id {
+        total-ratings: new-total,
+        rating-sum: new-sum,
+        average-rating: (/ (* new-sum u100) new-total)
+      }))
+    (ok true)))
+
 (define-read-only (get-dataset (dataset-id uint))
   (map-get? datasets dataset-id))
 
@@ -197,3 +246,32 @@
                                (get research-price dataset))))
               (some (* base-price (/ duration-blocks u4320))))
     none))
+
+(define-read-only (get-dataset-rating (dataset-id uint) (rater principal))
+  (map-get? dataset-ratings {dataset-id: dataset-id, rater: rater}))
+
+(define-read-only (get-dataset-reputation (dataset-id uint))
+  (default-to {total-ratings: u0, rating-sum: u0, average-rating: u0} 
+             (map-get? dataset-reputation dataset-id)))
+
+(define-read-only (get-dataset-average-rating (dataset-id uint))
+  (match (map-get? dataset-reputation dataset-id)
+    reputation (some (get average-rating reputation))
+    none))
+
+(define-read-only (get-top-rated-datasets (min-rating uint))
+  (let ((reputation-1 (get-dataset-reputation u1))
+        (reputation-2 (get-dataset-reputation u2))
+        (reputation-3 (get-dataset-reputation u3))
+        (reputation-4 (get-dataset-reputation u4))
+        (reputation-5 (get-dataset-reputation u5)))
+    (filter is-highly-rated 
+           (list 
+             {id: u1, avg: (get average-rating reputation-1)}
+             {id: u2, avg: (get average-rating reputation-2)}
+             {id: u3, avg: (get average-rating reputation-3)}
+             {id: u4, avg: (get average-rating reputation-4)}
+             {id: u5, avg: (get average-rating reputation-5)}))))
+
+(define-private (is-highly-rated (dataset-info {id: uint, avg: uint}))
+  (>= (get avg dataset-info) u400))
