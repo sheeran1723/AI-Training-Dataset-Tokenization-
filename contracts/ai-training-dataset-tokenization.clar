@@ -9,6 +9,9 @@
 (define-constant ERR_INVALID_RATING (err u107))
 (define-constant ERR_ALREADY_RATED (err u108))
 (define-constant ERR_NO_ACCESS_HISTORY (err u109))
+(define-constant ERR_SUBSCRIPTION_EXISTS (err u110))
+(define-constant ERR_NO_ACTIVE_SUBSCRIPTION (err u111))
+(define-constant ERR_INSUFFICIENT_SUBSCRIPTION_BALANCE (err u112))
 
 (define-data-var next-dataset-id uint u1)
 (define-data-var platform-fee-rate uint u250)
@@ -66,6 +69,25 @@
     total-ratings: uint,
     rating-sum: uint,
     average-rating: uint
+  })
+
+(define-map dataset-subscriptions
+  {dataset-id: uint, subscriber: principal}
+  {
+    monthly-price: uint,
+    balance: uint,
+    auto-renew: bool,
+    created-at: uint,
+    last-payment: uint,
+    is-active: bool
+  })
+
+(define-map subscription-usage
+  {dataset-id: uint, subscriber: principal}
+  {
+    monthly-downloads: uint,
+    total-downloads: uint,
+    current-period-start: uint
   })
 
 (define-public (mint-dataset 
@@ -206,6 +228,102 @@
       }))
     (ok true)))
 
+(define-public (subscribe-to-dataset 
+  (dataset-id uint)
+  (monthly-price uint)
+  (prepaid-months uint)
+  (auto-renew bool))
+  (let ((dataset (unwrap! (map-get? datasets dataset-id) ERR_DATASET_NOT_FOUND))
+        (existing-subscription (map-get? dataset-subscriptions {dataset-id: dataset-id, subscriber: tx-sender}))
+        (total-payment (* monthly-price prepaid-months))
+        (platform-fee (/ (* total-payment (var-get platform-fee-rate)) u10000))
+        (creator-payment (- total-payment platform-fee)))
+    (asserts! (> monthly-price u0) ERR_INVALID_LICENSE_TYPE)
+    (asserts! (> prepaid-months u0) ERR_INVALID_LICENSE_TYPE)
+    (asserts! (is-none existing-subscription) ERR_SUBSCRIPTION_EXISTS)
+    (try! (stx-transfer? total-payment tx-sender CONTRACT_OWNER))
+    (map-set dataset-subscriptions 
+      {dataset-id: dataset-id, subscriber: tx-sender}
+      {
+        monthly-price: monthly-price,
+        balance: prepaid-months,
+        auto-renew: auto-renew,
+        created-at: stacks-block-height,
+        last-payment: stacks-block-height,
+        is-active: true
+      })
+    (map-set subscription-usage
+      {dataset-id: dataset-id, subscriber: tx-sender}
+      {
+        monthly-downloads: u0,
+        total-downloads: u0,
+        current-period-start: stacks-block-height
+      })
+    (map-set creator-earnings 
+      (get creator dataset)
+      (+ (default-to u0 (map-get? creator-earnings (get creator dataset))) creator-payment))
+    (map-set datasets dataset-id
+      (merge dataset {total-revenue: (+ (get total-revenue dataset) total-payment)}))
+    (ok true)))
+
+(define-public (access-dataset-subscription (dataset-id uint))
+  (let ((subscription (unwrap! (map-get? dataset-subscriptions {dataset-id: dataset-id, subscriber: tx-sender}) ERR_NO_ACTIVE_SUBSCRIPTION))
+        (usage (unwrap! (map-get? subscription-usage {dataset-id: dataset-id, subscriber: tx-sender}) ERR_NO_ACTIVE_SUBSCRIPTION))
+        (blocks-per-month u4320)
+        (current-period-elapsed (- stacks-block-height (get current-period-start usage)))
+        (is-new-period (>= current-period-elapsed blocks-per-month)))
+    (asserts! (get is-active subscription) ERR_NO_ACTIVE_SUBSCRIPTION)
+    (asserts! (> (get balance subscription) u0) ERR_INSUFFICIENT_SUBSCRIPTION_BALANCE)
+    (if is-new-period
+      (let ((new-balance (- (get balance subscription) u1)))
+        (map-set dataset-subscriptions
+          {dataset-id: dataset-id, subscriber: tx-sender}
+          (merge subscription {balance: new-balance, is-active: (> new-balance u0)}))
+        (map-set subscription-usage
+          {dataset-id: dataset-id, subscriber: tx-sender}
+          {
+            monthly-downloads: u1,
+            total-downloads: (+ (get total-downloads usage) u1),
+            current-period-start: stacks-block-height
+          }))
+      (map-set subscription-usage
+        {dataset-id: dataset-id, subscriber: tx-sender}
+        (merge usage {
+          monthly-downloads: (+ (get monthly-downloads usage) u1),
+          total-downloads: (+ (get total-downloads usage) u1)
+        })))
+    (ok true)))
+
+(define-public (cancel-subscription (dataset-id uint))
+  (let ((subscription (unwrap! (map-get? dataset-subscriptions {dataset-id: dataset-id, subscriber: tx-sender}) ERR_NO_ACTIVE_SUBSCRIPTION)))
+    (asserts! (get is-active subscription) ERR_NO_ACTIVE_SUBSCRIPTION)
+    (map-set dataset-subscriptions
+      {dataset-id: dataset-id, subscriber: tx-sender}
+      (merge subscription {is-active: false, auto-renew: false}))
+    (ok true)))
+
+(define-public (renew-subscription 
+  (dataset-id uint)
+  (additional-months uint))
+  (let ((subscription (unwrap! (map-get? dataset-subscriptions {dataset-id: dataset-id, subscriber: tx-sender}) ERR_NO_ACTIVE_SUBSCRIPTION))
+        (dataset (unwrap! (map-get? datasets dataset-id) ERR_DATASET_NOT_FOUND))
+        (renewal-payment (* (get monthly-price subscription) additional-months))
+        (platform-fee (/ (* renewal-payment (var-get platform-fee-rate)) u10000))
+        (creator-payment (- renewal-payment platform-fee)))
+    (asserts! (> additional-months u0) ERR_INVALID_LICENSE_TYPE)
+    (try! (stx-transfer? renewal-payment tx-sender CONTRACT_OWNER))
+    (map-set dataset-subscriptions
+      {dataset-id: dataset-id, subscriber: tx-sender}
+      (merge subscription {
+        balance: (+ (get balance subscription) additional-months),
+        is-active: true,
+        last-payment: stacks-block-height
+      }))
+    (map-set creator-earnings 
+      (get creator dataset)
+      (+ (default-to u0 (map-get? creator-earnings (get creator dataset))) creator-payment))
+    (ok true)))
+
 (define-read-only (get-dataset (dataset-id uint))
   (map-get? datasets dataset-id))
 
@@ -275,3 +393,24 @@
 
 (define-private (is-highly-rated (dataset-info {id: uint, avg: uint}))
   (>= (get avg dataset-info) u400))
+
+(define-read-only (get-subscription (dataset-id uint) (subscriber principal))
+  (map-get? dataset-subscriptions {dataset-id: dataset-id, subscriber: subscriber}))
+
+(define-read-only (get-subscription-usage (dataset-id uint) (subscriber principal))
+  (map-get? subscription-usage {dataset-id: dataset-id, subscriber: subscriber}))
+
+(define-read-only (check-subscription-active (dataset-id uint) (subscriber principal))
+  (match (map-get? dataset-subscriptions {dataset-id: dataset-id, subscriber: subscriber})
+    subscription (and (get is-active subscription) (> (get balance subscription) u0))
+    false))
+
+(define-read-only (get-subscription-time-remaining (dataset-id uint) (subscriber principal))
+  (match (map-get? dataset-subscriptions {dataset-id: dataset-id, subscriber: subscriber})
+    subscription (if (and (get is-active subscription) (> (get balance subscription) u0))
+                   (some (get balance subscription))
+                   none)
+    none))
+
+(define-read-only (calculate-subscription-cost (monthly-price uint) (months uint))
+  (some (* monthly-price months)))
