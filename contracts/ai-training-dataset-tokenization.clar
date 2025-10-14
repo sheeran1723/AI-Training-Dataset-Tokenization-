@@ -12,9 +12,15 @@
 (define-constant ERR_SUBSCRIPTION_EXISTS (err u110))
 (define-constant ERR_NO_ACTIVE_SUBSCRIPTION (err u111))
 (define-constant ERR_INSUFFICIENT_SUBSCRIPTION_BALANCE (err u112))
+(define-constant ERR_BOUNTY_NOT_FOUND (err u113))
+(define-constant ERR_BOUNTY_ALREADY_CLAIMED (err u114))
+(define-constant ERR_BOUNTY_NOT_CLAIMED (err u115))
+(define-constant ERR_INVALID_BOUNTY_AMOUNT (err u116))
+(define-constant ERR_BOUNTY_EXPIRED (err u117))
 
 (define-data-var next-dataset-id uint u1)
 (define-data-var platform-fee-rate uint u250)
+(define-data-var next-bounty-id uint u1)
 
 (define-map datasets
   uint
@@ -89,6 +95,25 @@
     total-downloads: uint,
     current-period-start: uint
   })
+
+(define-map dataset-bounties
+  uint
+  {
+    requester: principal,
+    title: (string-ascii 128),
+    description: (string-ascii 512),
+    reward-amount: uint,
+    expires-at: uint,
+    created-at: uint,
+    is-claimed: bool,
+    is-fulfilled: bool,
+    claimer: (optional principal),
+    fulfilled-dataset-id: (optional uint)
+  })
+
+(define-map bounty-contributors
+  uint
+  (list 10 {contributor: principal, amount: uint}))
 
 (define-public (mint-dataset 
   (name (string-ascii 64))
@@ -414,3 +439,114 @@
 
 (define-read-only (calculate-subscription-cost (monthly-price uint) (months uint))
   (some (* monthly-price months)))
+
+(define-public (create-bounty 
+  (title (string-ascii 128))
+  (description (string-ascii 512))
+  (reward-amount uint)
+  (duration-blocks uint))
+  (let ((bounty-id (var-get next-bounty-id))
+        (expires-at (+ stacks-block-height duration-blocks)))
+    (asserts! (> reward-amount u0) ERR_INVALID_BOUNTY_AMOUNT)
+    (asserts! (> duration-blocks u0) ERR_INVALID_LICENSE_TYPE)
+    (try! (stx-transfer? reward-amount tx-sender (as-contract tx-sender)))
+    (map-set dataset-bounties bounty-id {
+      requester: tx-sender,
+      title: title,
+      description: description,
+      reward-amount: reward-amount,
+      expires-at: expires-at,
+      created-at: stacks-block-height,
+      is-claimed: false,
+      is-fulfilled: false,
+      claimer: none,
+      fulfilled-dataset-id: none
+    })
+    (map-set bounty-contributors bounty-id (list {contributor: tx-sender, amount: reward-amount}))
+    (var-set next-bounty-id (+ bounty-id u1))
+    (ok bounty-id)))
+
+(define-public (contribute-to-bounty 
+  (bounty-id uint)
+  (amount uint))
+  (let ((bounty (unwrap! (map-get? dataset-bounties bounty-id) ERR_BOUNTY_NOT_FOUND))
+        (contributors (default-to (list) (map-get? bounty-contributors bounty-id)))
+        (new-total (+ (get reward-amount bounty) amount)))
+    (asserts! (not (get is-claimed bounty)) ERR_BOUNTY_ALREADY_CLAIMED)
+    (asserts! (< stacks-block-height (get expires-at bounty)) ERR_BOUNTY_EXPIRED)
+    (asserts! (> amount u0) ERR_INVALID_BOUNTY_AMOUNT)
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    (map-set dataset-bounties bounty-id
+      (merge bounty {reward-amount: new-total}))
+    (match (as-max-len? (append contributors {contributor: tx-sender, amount: amount}) u10)
+      updated-list (map-set bounty-contributors bounty-id updated-list)
+      (map-set bounty-contributors bounty-id contributors))
+    (ok true)))
+
+(define-public (claim-bounty (bounty-id uint))
+  (let ((bounty (unwrap! (map-get? dataset-bounties bounty-id) ERR_BOUNTY_NOT_FOUND)))
+    (asserts! (not (get is-claimed bounty)) ERR_BOUNTY_ALREADY_CLAIMED)
+    (asserts! (< stacks-block-height (get expires-at bounty)) ERR_BOUNTY_EXPIRED)
+    (map-set dataset-bounties bounty-id
+      (merge bounty {is-claimed: true, claimer: (some tx-sender)}))
+    (ok true)))
+
+(define-public (fulfill-bounty 
+  (bounty-id uint)
+  (dataset-id uint))
+  (let ((bounty (unwrap! (map-get? dataset-bounties bounty-id) ERR_BOUNTY_NOT_FOUND))
+        (dataset (unwrap! (map-get? datasets dataset-id) ERR_DATASET_NOT_FOUND))
+        (platform-fee (/ (* (get reward-amount bounty) (var-get platform-fee-rate)) u10000))
+        (creator-payment (- (get reward-amount bounty) platform-fee)))
+    (asserts! (get is-claimed bounty) ERR_BOUNTY_NOT_CLAIMED)
+    (asserts! (not (get is-fulfilled bounty)) ERR_BOUNTY_ALREADY_CLAIMED)
+    (asserts! (is-eq (some tx-sender) (get claimer bounty)) ERR_NOT_AUTHORIZED)
+    (asserts! (is-eq (get creator dataset) tx-sender) ERR_NOT_AUTHORIZED)
+    (asserts! (< stacks-block-height (get expires-at bounty)) ERR_BOUNTY_EXPIRED)
+    (try! (as-contract (stx-transfer? creator-payment tx-sender tx-sender)))
+    (map-set dataset-bounties bounty-id
+      (merge bounty {is-fulfilled: true, fulfilled-dataset-id: (some dataset-id)}))
+    (ok true)))
+
+(define-public (cancel-bounty (bounty-id uint))
+  (let ((bounty (unwrap! (map-get? dataset-bounties bounty-id) ERR_BOUNTY_NOT_FOUND)))
+    (asserts! (is-eq tx-sender (get requester bounty)) ERR_NOT_AUTHORIZED)
+    (asserts! (not (get is-claimed bounty)) ERR_BOUNTY_ALREADY_CLAIMED)
+    (asserts! (not (get is-fulfilled bounty)) ERR_BOUNTY_ALREADY_CLAIMED)
+    (try! (as-contract (stx-transfer? (get reward-amount bounty) tx-sender (get requester bounty))))
+    (map-set dataset-bounties bounty-id
+      (merge bounty {reward-amount: u0}))
+    (ok true)))
+
+(define-public (reclaim-expired-bounty (bounty-id uint))
+  (let ((bounty (unwrap! (map-get? dataset-bounties bounty-id) ERR_BOUNTY_NOT_FOUND)))
+    (asserts! (is-eq tx-sender (get requester bounty)) ERR_NOT_AUTHORIZED)
+    (asserts! (not (get is-fulfilled bounty)) ERR_BOUNTY_ALREADY_CLAIMED)
+    (asserts! (>= stacks-block-height (get expires-at bounty)) ERR_LICENSE_EXPIRED)
+    (try! (as-contract (stx-transfer? (get reward-amount bounty) tx-sender (get requester bounty))))
+    (map-set dataset-bounties bounty-id
+      (merge bounty {reward-amount: u0}))
+    (ok true)))
+
+(define-read-only (get-bounty (bounty-id uint))
+  (map-get? dataset-bounties bounty-id))
+
+(define-read-only (get-bounty-contributors (bounty-id uint))
+  (default-to (list) (map-get? bounty-contributors bounty-id)))
+
+(define-read-only (check-bounty-active (bounty-id uint))
+  (match (map-get? dataset-bounties bounty-id)
+    bounty (and (not (get is-claimed bounty)) 
+                (not (get is-fulfilled bounty))
+                (< stacks-block-height (get expires-at bounty)))
+    false))
+
+(define-read-only (get-bounty-time-remaining (bounty-id uint))
+  (match (map-get? dataset-bounties bounty-id)
+    bounty (if (> (get expires-at bounty) stacks-block-height)
+             (some (- (get expires-at bounty) stacks-block-height))
+             none)
+    none))
+
+(define-read-only (get-next-bounty-id)
+  (var-get next-bounty-id))
